@@ -22,6 +22,38 @@ pub const DEFAULT_SEED: u64 = 0;
 /// Default context window, in tokens. Final contexts average ~6-7k tokens; 16k leaves
 /// headroom for long issues without the memory of the full 32k evaluation window.
 pub const DEFAULT_CONTEXT_SIZE: usize = 16384;
+/// Default timeout for one request to a user-configured endpoint, in seconds.
+pub const DEFAULT_ENDPOINT_TIMEOUT_SECS: u64 = 600;
+
+/// The API an OpenAI-compatible agent endpoint speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EndpointApi {
+    /// `/completions`: the agent renders the prompt and parses tool calls from text.
+    #[default]
+    Completions,
+    /// `/chat/completions`: the server owns the chat template and emits structured
+    /// tool calls.
+    Chat,
+}
+
+impl EndpointApi {
+    /// Parse a user-facing value (`completions` or `chat`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "completions" | "completion" => Some(Self::Completions),
+            "chat" | "chat-completions" => Some(Self::Chat),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completions => "completions",
+            Self::Chat => "chat",
+        }
+    }
+}
 
 /// Persisted agent settings (all optional).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -34,12 +66,20 @@ pub struct AgentSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_file: Option<String>,
     /// OpenAI-compatible server (vLLM, llama-server, ...) to use instead of local
-    /// inference, e.g. `http://localhost:8000/v1`. Prompts go through `/completions`.
+    /// inference, e.g. `http://localhost:8000/v1`. The API is chosen by
+    /// [`AgentSettings::endpoint_api`]: `/completions` by default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
     /// Model name sent to the endpoint (defaults to the model setting).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint_model: Option<String>,
+    /// API the endpoint speaks: `completions` (default, raw prompts) or `chat`
+    /// (chat-completions: structured messages and tool calls).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_api: Option<EndpointApi>,
+    /// Request timeout for the endpoint, in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_timeout_secs: Option<u64>,
     /// File replacing the system prompt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt_file: Option<String>,
@@ -105,6 +145,18 @@ impl AgentSettings {
 
     pub fn context_size(&self) -> usize {
         self.context_size.unwrap_or(DEFAULT_CONTEXT_SIZE)
+    }
+
+    /// Which API the configured endpoint speaks (ignored without an endpoint).
+    pub fn endpoint_api(&self) -> EndpointApi {
+        self.endpoint_api.unwrap_or_default()
+    }
+
+    /// Timeout for one endpoint request.
+    pub fn endpoint_timeout_secs(&self) -> u64 {
+        self.endpoint_timeout_secs
+            .filter(|s| *s > 0)
+            .unwrap_or(DEFAULT_ENDPOINT_TIMEOUT_SECS)
     }
 
     /// The session configuration these settings describe.
@@ -189,6 +241,29 @@ mod tests {
             (0.6, 0.95, 20, 2048)
         );
         assert_eq!(s.model(), DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn endpoint_api_defaults_to_completions_and_roundtrips() {
+        let mut s = AgentSettings::default();
+        assert_eq!(s.endpoint_api(), EndpointApi::Completions);
+        assert_eq!(s.endpoint_timeout_secs(), DEFAULT_ENDPOINT_TIMEOUT_SECS);
+        assert!(!serde_json::to_string(&s).unwrap().contains("endpoint_api"));
+
+        s.endpoint_api = Some(EndpointApi::Chat);
+        s.endpoint_timeout_secs = Some(30);
+        assert_eq!(s.endpoint_api(), EndpointApi::Chat);
+        assert_eq!(s.endpoint_timeout_secs(), 30);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"endpoint_api\":\"chat\""));
+        assert_eq!(serde_json::from_str::<AgentSettings>(&json).unwrap(), s);
+
+        assert_eq!(EndpointApi::parse("chat"), Some(EndpointApi::Chat));
+        assert_eq!(
+            EndpointApi::parse("completions"),
+            Some(EndpointApi::Completions)
+        );
+        assert_eq!(EndpointApi::parse("responses"), None);
     }
 
     #[test]

@@ -200,8 +200,7 @@ pub fn cmd_agent(
         task,
         &repo_root,
         &session_config,
-        &engine.template,
-        engine.generator.as_mut(),
+        engine.model.as_mut(),
         &mut backend,
         observer,
     )?;
@@ -216,7 +215,19 @@ pub fn cmd_agent(
             .iter()
             .map(|m| m.to_template_value())
             .collect();
-        std::fs::write(&path, serde_json::to_string_pretty(&messages)?).with_context(|| {
+        // The transcript plus what produced it: backend, model, the tool definitions the
+        // model was served, and why the session stopped.
+        let trace = serde_json::json!({
+            "backend": engine.backend.as_str(),
+            "model": engine.description,
+            "tools": session_config.tools,
+            "requests": outcome.requests,
+            "messages": messages,
+            "turns": outcome.turns,
+            "end_reason": format!("{:?}", outcome.end_reason),
+            "error": outcome.error,
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&trace)?).with_context(|| {
             format!("writing agent trace to {}", PathBuf::from(&path).display())
         })?;
     }
@@ -373,12 +384,14 @@ pub fn cmd_install_agent(force_cpu: bool) -> Result<()> {
     // Compute the cache of the prompt every question starts with now, so the first
     // question does not pay for it.
     let session_config = settings.session_config().map_err(anyhow::Error::msg)?;
-    colgrep_agent::session::warm_prefix(
-        &engine.template,
-        &session_config,
-        engine.generator.as_mut(),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    engine
+        .model
+        .warm_prefix(
+            &session_config.system_prompt,
+            &session_config.tools,
+            session_config.enable_thinking,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     println!("✓ colgrep --agent is ready · {}", engine.description);
     println!("  Try: colgrep --agent \"where is the configuration loaded\"");
     Ok(())
@@ -678,6 +691,21 @@ pub fn apply_agent_settings(settings: &mut AgentSettings, args: &AgentSettingsAr
     if let Some(v) = &a.endpoint_model {
         settings.endpoint_model = parse_text(v);
     }
+    if let Some(v) = &a.endpoint_api {
+        settings.endpoint_api = match parse_text(v) {
+            Some(s) => Some(
+                colgrep_agent::config::EndpointApi::parse(&s).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "invalid value for --agent-endpoint-api: {s} (use completions, chat or default)"
+                    )
+                })?,
+            ),
+            None => None,
+        };
+    }
+    if let Some(v) = &a.endpoint_timeout {
+        settings.endpoint_timeout_secs = parse_opt("agent-endpoint-timeout", v)?.filter(|s| *s > 0);
+    }
     if let Some(v) = &a.system_prompt_file {
         settings.system_prompt_file = parse_file("agent-prompt", v)?;
     }
@@ -758,8 +786,8 @@ pub fn apply_agent_settings(settings: &mut AgentSettings, args: &AgentSettingsAr
 pub fn print_agent_settings(s: &AgentSettings) {
     let d = colgrep_agent::session::SessionConfig::default();
     let show = |name: &str, value: Option<String>, default: String| match value {
-        Some(v) => println!("  {name:<20}{v}"),
-        None => println!("  {name:<20}{default} (default)"),
+        Some(v) => println!("  {name:<22} {v}"),
+        None => println!("  {name:<22} {default} (default)"),
     };
     println!("Agent (colgrep --agent):");
     show("agent-model", s.model.clone(), s.model().to_string());
@@ -778,6 +806,18 @@ pub fn print_agent_settings(s: &AgentSettings) {
             "agent-endpoint-model",
             s.endpoint_model.clone(),
             s.model().to_string(),
+        );
+        show(
+            "agent-endpoint-api",
+            s.endpoint_api.map(|a| a.as_str().to_string()),
+            colgrep_agent::config::EndpointApi::Completions
+                .as_str()
+                .to_string(),
+        );
+        show(
+            "agent-endpoint-timeout",
+            s.endpoint_timeout_secs.map(|v| format!("{v}s")),
+            format!("{}s", colgrep_agent::config::DEFAULT_ENDPOINT_TIMEOUT_SECS),
         );
     }
     show(
@@ -941,6 +981,44 @@ mod tests {
         )
         .unwrap();
         assert!(s.is_empty());
+    }
+
+    #[test]
+    fn endpoint_api_values_parse_and_validate() {
+        let mut s = AgentSettings::default();
+        apply_agent_settings(
+            &mut s,
+            &AgentSettingsArgs {
+                endpoint: Some("http://localhost:8000/v1".into()),
+                endpoint_api: Some("chat".into()),
+                endpoint_timeout: Some("30".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            s.endpoint_api,
+            Some(colgrep_agent::config::EndpointApi::Chat)
+        );
+        assert_eq!(s.endpoint_timeout_secs, Some(30));
+        assert!(apply_agent_settings(
+            &mut s,
+            &AgentSettingsArgs {
+                endpoint_api: Some("responses".into()),
+                ..Default::default()
+            },
+        )
+        .is_err());
+        apply_agent_settings(
+            &mut s,
+            &AgentSettingsArgs {
+                endpoint_api: Some("default".into()),
+                endpoint_timeout: Some("default".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((s.endpoint_api, s.endpoint_timeout_secs), (None, None));
     }
 
     #[test]

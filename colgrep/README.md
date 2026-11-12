@@ -216,6 +216,8 @@ colgrep settings --agent-threads 6                  # default: performance cores
 colgrep settings --agent-thinking on                # for models trained with reasoning
 colgrep settings --agent-runtime server             # auto (default), builtin (Apple Silicon) or server
 colgrep settings --agent-llama-server ~/llama.cpp/build/bin/llama-server  # e.g. your own CUDA build
+colgrep settings --agent-endpoint http://localhost:8000/v1 --agent-endpoint-api chat  # remote chat-completions
+colgrep settings --agent-endpoint-timeout 900       # per-request timeout (default 600 s)
 ```
 
 | Setting | Default |
@@ -225,13 +227,23 @@ colgrep settings --agent-llama-server ~/llama.cpp/build/bin/llama-server  # e.g.
 | `--agent-search-k` | 10 hits per search (the model may ask for up to 25) |
 | `--agent-temperature` / `--agent-top-p` / `--agent-top-k` | 0.6 / 0.95 / 20 (evaluation sampling) |
 | `--agent-max-tokens` / `--agent-context` | 2048 per turn / 16384 |
+| `--agent-endpoint-api` / `--agent-endpoint-timeout` | `completions` / 600 s |
 | `--agent-seed` | 0 (reproducible) |
 
 Private model repos use the same token lookup as the encoder (`HF_TOKEN`, then `HUGGING_FACE_HUB_TOKEN`, then the HF token file).
 
 ### Serving the model on a GPU server
 
-Point the agent at any OpenAI-compatible server; prompts go through `/v1/completions`, so no server-side tool parser is needed:
+The agent can run against any OpenAI-compatible endpoint instead of local inference. Two APIs are supported, selected with `--agent-endpoint-api`:
+
+| `--agent-endpoint-api` | Request | Who formats the model |
+|---|---|---|
+| `completions` (default) | `/v1/completions` with a raw prompt | colgrep renders the model's chat template and parses tool calls from text |
+| `chat` | `/v1/chat/completions` with structured messages and tools | the server, using the model's own chat template and tool-call syntax |
+
+#### Raw-completions backend (default)
+
+Prompts go through `/v1/completions`, so no server-side tool parser is needed:
 
 ```bash
 # llama-server (--special keeps the tool-call tokens in the output)
@@ -239,7 +251,78 @@ llama-server -m colgrep-agent-2B-Q8_0.gguf --port 8000 --special
 colgrep settings --agent-endpoint http://localhost:8000/v1
 ```
 
-Set `COLGREP_AGENT_API_KEY` (or `OPENAI_API_KEY`) if the server needs one. `COLGREP_AGENT_DEBUG=1` prints per-turn timings and `COLGREP_AGENT_TRACE=trace.json` saves the full transcript.
+#### Chat-completions backend
+
+Use the chat backend for a model that was trained with another tool-call syntax (for example Gemma 4 E4B on llama.cpp). The server owns the model's template and native tool serialization; colgrep sends structured messages and tool definitions and receives structured calls, so it needs no model-specific parser and no `--special` / `--preserved-tokens` workaround:
+
+```bash
+# llama.cpp with Gemma 4 E4B (any chat model with tool support works)
+llama-server -m /path/to/gemma-4-e4b.gguf --host 127.0.0.1 --port 9931 \
+  --ctx-size 65536 --jinja
+
+colgrep settings --agent-endpoint http://localhost:9931/v1 \
+                 --agent-endpoint-api chat \
+                 --agent-endpoint-model google/gemma-4-e4b-it
+colgrep --agent "where is a session token validated" ./src
+```
+
+Requirements and limits of the chat backend:
+
+- llama.cpp must load the model's Jinja chat template (`--jinja`) and support tool calls for that model. vLLM works with `--enable-auto-tool-choice` and the matching `--tool-call-parser`.
+- Requests are non-streaming: one request per turn. Input is text only.
+- Reasoning is off by default (`--agent-thinking on` enables it). The setting is sent as `chat_template_kwargs: {"enable_thinking": …}`, a llama.cpp/vLLM extension; the model's template must understand it.
+- `--agent-chat-template` is ignored: the server applies its own template (colgrep warns if one is configured). The system prompt, tool schemas, turn budget, search defaults, sampling and final-turn rules apply exactly as for local inference.
+- `--agent-context` is a local-inference setting; the chat backend uses the server's context size (`--ctx-size`). Endpoint requests time out after `--agent-endpoint-timeout` seconds (default 600).
+
+Set `COLGREP_AGENT_API_KEY` (or `OPENAI_API_KEY`) if the server needs one; the key is sent as a bearer token and never written to logs or traces. `COLGREP_AGENT_PROFILE=1` prints per-turn timings and `COLGREP_AGENT_TRACE=trace.json` saves the backend, model, served tool definitions, per-turn request records and the full transcript.
+
+Design notes, compatibility behavior and the failure matrix are in [`agent/CHAT_BACKEND.md`](../agent/CHAT_BACKEND.md).
+
+#### Troubleshooting a remote backend
+
+| Symptom | Cause and fix |
+|---|---|
+| `Connection Failed: … Connection refused` | Nothing is listening on the endpoint, or the host/port is wrong. Start `llama-server` and check the URL. |
+| `HTTP 401` / `HTTP 403` | The server requires authentication. Set `COLGREP_AGENT_API_KEY` (or `OPENAI_API_KEY`). |
+| `HTTP 404 … does the endpoint include the API prefix` | The URL must include the API prefix: `http://host:port/v1`. |
+| `HTTP 400 … exceeds the available context size` | The conversation outgrew the server's context. Raise `--ctx-size` on llama-server (the reported counts are in the error) or lower `--agent-max-turns` / `--agent-search-k`. |
+| `finish_reason: length`, no tool call | The turn hit `--agent-max-tokens`, commonly because reasoning was left on. Raise the limit or use `--agent-thinking off`. |
+| Repeats “no tool call — asking again” | The model answered with prose instead of calling a tool, three times. Check that its template/tool-call parser is active (`--jinja`, `--enable-auto-tool-choice`), or lower the sampling temperature. |
+| The result lists whole files instead of ranges | Protocol compatibility, not a bug: a general model may localize less precisely than the trained checkpoint. Ask a narrower question or use `--agent-model` with the local checkpoint. |
+
+#### Live smoke test (Gemma 4 E4B on llama.cpp)
+
+Routine `cargo test` never downloads a model or contacts a server; this manual check exercises the whole chat path. With llama.cpp already serving the model (the commands above), use an isolated data directory so the test does not touch your settings or indices:
+
+```bash
+cargo build -p colgrep
+mkdir -p /tmp/colgrep-chat/indices
+cat > /tmp/colgrep-chat/config.json <<'JSON'
+{"agent":{"endpoint":"http://localhost:9931/v1","endpoint_api":"chat",
+          "endpoint_model":"google/gemma-4-e4b-it"}}
+JSON
+COLGREP_DATA_DIR=/tmp/colgrep-chat/indices COLGREP_AGENT_TRACE=/tmp/colgrep-chat/trace.json \
+  ./target/debug/colgrep --agent \
+  "Where does the agent give up after repeated malformed replies?" agent/src --json -y
+```
+
+Observed on 2026-11-12 against llama.cpp serving `google/gemma-4-e4b-it` (65536-token context). One sample run: the agent ran 6 turns and 5 `colgrep` searches, every call was paired with its result in the trace, and it submitted through `finish`. Sampling is stochastic (the seed varies per turn), so turn and token counts differ between runs, but the qualitative result reproduces:
+
+| Field | Value |
+|---|---|
+| `submitted` / `end_reason` | `true` / `Answered` |
+| `turns` / `searches` | 6 / 5 |
+| `prompt_tokens` / `cached_prompt_tokens` / `completion_tokens` | 12334 / 9830 / 252 |
+| `llm_seconds` / `seconds` | 1.41 / 30.94 (includes one-time indexing) |
+
+Run the procedure from the repository root (`agent/src` is relative to it). To check the final-turn rule, put a smaller budget in the same nested block and rerun:
+
+```json
+{"agent":{"endpoint":"http://localhost:9931/v1","endpoint_api":"chat",
+          "endpoint_model":"google/gemma-4-e4b-it","max_turns":2}}
+```
+
+Turn 2 is then the final turn. The trace's `requests` entry for that turn lists only `finish` as served, the conversation ends with the final-turn reminder, and the request (verified with a logging proxy) carries `tool_choice: "required"`; the model's `finish` call is reported as `Answered`. The end-of-session rule is therefore enforced on the server path too.
 
 ## CLI Reference
 

@@ -867,6 +867,15 @@ pub struct AgentSettingsArgs {
     #[arg(long = "agent-endpoint-model", value_name = "NAME")]
     pub endpoint_model: Option<String>,
 
+    /// API the agent endpoint speaks: completions (default: raw prompts) or chat
+    /// (chat-completions: structured messages and tool calls, server-side template)
+    #[arg(long = "agent-endpoint-api", value_name = "completions|chat")]
+    pub endpoint_api: Option<String>,
+
+    /// Timeout for one endpoint request, in seconds (default 600)
+    #[arg(long = "agent-endpoint-timeout", value_name = "SECS")]
+    pub endpoint_timeout: Option<String>,
+
     /// File with a custom agent system prompt
     #[arg(long = "agent-prompt", value_name = "FILE")]
     pub system_prompt_file: Option<String>,

@@ -8,14 +8,12 @@
 use std::path::Path;
 use std::time::Instant;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
-use crate::llm::{GenParams, Generation, Generator, LlmError};
+use crate::llm::{GenParams, Generation, LlmError, TurnModel, TurnOptions};
 use crate::protocol::{self, Message, ToolCall};
 use crate::sandbox::Sandbox;
 use crate::search::{self, SearchBackend};
-use crate::template::ChatTemplate;
-use crate::toolcall;
 
 /// What drives a session. Defaults reproduce the trained harness exactly.
 #[derive(Debug, Clone)]
@@ -103,10 +101,16 @@ pub enum Event<'a> {
         content: &'a str,
         calls: usize,
     },
+    /// A call the model produced, before it runs.
+    ///
+    /// A backend that streams markup renders the call while the model writes it; a
+    /// structured backend has no markup to stream, so this is where its calls become
+    /// visible. Each call is announced exactly once, whether or not it is executed.
     ToolCalled {
         turn: usize,
+        /// The tool name as the model wrote it (`colgrep`, `terminal`, `finish`).
         tool: &'a str,
-        command: &'a str,
+        arguments: &'a Map<String, Value>,
     },
     ToolReturned {
         turn: usize,
@@ -128,6 +132,18 @@ impl Observer for () {
     fn on_event(&mut self, _: &Event<'_>) {}
 }
 
+/// One request the session sent to the model (diagnostics).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RequestRecord {
+    pub turn: usize,
+    /// Only `finish` was served and its call was forced.
+    pub final_turn: bool,
+    /// Tool names sent with the request, in order.
+    pub tools: Vec<String>,
+    /// Messages in the conversation at the time of the request.
+    pub messages: usize,
+}
+
 /// Everything a session produced.
 #[derive(Debug, Clone)]
 pub struct Outcome {
@@ -147,6 +163,8 @@ pub struct Outcome {
     pub llm_ms: f64,
     pub tool_ms: f64,
     pub messages: Vec<Message>,
+    /// What each turn sent: backend-independent (tools served, final-turn narrowing).
+    pub requests: Vec<RequestRecord>,
     pub profile: Profile,
 }
 
@@ -175,12 +193,15 @@ pub struct Profile {
 }
 
 /// Run one session over `repo` for `task`.
+///
+/// `model` supplies the assistant turns (a prompt-rendered local/completion engine or a
+/// chat-completions endpoint); everything else - the tool schemas, the executor, the
+/// budgets and the `finish` validation - is backend-independent.
 pub fn run(
     task: &str,
     repo: &Path,
     config: &SessionConfig,
-    template: &ChatTemplate,
-    llm: &mut dyn Generator,
+    model: &mut dyn TurnModel,
     search_backend: &mut dyn SearchBackend,
     observer: &mut dyn Observer,
 ) -> std::io::Result<Outcome> {
@@ -204,6 +225,7 @@ pub fn run(
         llm_ms: 0.0,
         tool_ms: 0.0,
         messages: Vec::new(),
+        requests: Vec::new(),
         profile: Profile::default(),
     };
     let finish_only: Vec<Value> = config
@@ -213,10 +235,12 @@ pub fn run(
         .cloned()
         .collect();
     let t = Instant::now();
-    warm_prefix(template, config, llm).map_err(std::io::Error::other)?;
+    model
+        .warm_prefix(&config.system_prompt, &config.tools, config.enable_thinking)
+        .map_err(std::io::Error::other)?;
     out.profile.warm_prefix_ms = ms(t);
     let mut retries = 0;
-    let mut call_ids = 0usize;
+    let mut next_call_id = 0usize;
     let max_turns = config.max_turns.max(1);
     let mut sampling = config.sampling.clone();
 
@@ -237,33 +261,32 @@ pub fn run(
         } else {
             &config.tools
         };
-        let mut prompt = match template.render(&messages, tools, config.enable_thinking) {
-            Ok(p) => p,
-            Err(e) => {
-                out.end_reason = EndReason::LlmError;
-                out.error = Some(format!("chat template: {e}"));
-                break;
-            }
-        };
-        // The harness forced `tool_choice=finish` here; with raw text that is a prefill.
-        let prefill = if final_turn {
-            "<function name=\"finish\">"
-        } else {
-            ""
-        };
-        prompt.push_str(prefill);
+        out.requests.push(RequestRecord {
+            turn,
+            final_turn,
+            tools: tools
+                .iter()
+                .filter_map(|t| {
+                    t.pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect(),
+            messages: messages.len(),
+        });
         // Vary the seed per turn so a resampled malformed turn is a fresh draw.
         sampling.seed = config.sampling.seed.wrapping_add(turn as u64);
-        if !prefill.is_empty() {
-            observer.on_event(&Event::Token {
-                turn,
-                text: prefill,
-            });
-        }
-        let generation = match llm.generate_streaming(&prompt, &sampling, &mut |text| {
-            observer.on_event(&Event::Token { turn, text })
-        }) {
-            Ok(g) => g,
+        let mut reply = match model.next_turn(
+            &messages,
+            tools,
+            &TurnOptions {
+                final_turn,
+                enable_thinking: config.enable_thinking,
+                sampling: sampling.clone(),
+            },
+            &mut |text| observer.on_event(&Event::Token { turn, text }),
+        ) {
+            Ok(r) => r,
             Err(e) => {
                 out.end_reason = match e {
                     LlmError::ContextOverflow { .. } => EndReason::ContextOverflow,
@@ -273,33 +296,40 @@ pub fn run(
                 break;
             }
         };
-        out.prompt_tokens += generation.prompt_tokens;
-        out.cached_tokens += generation.cached_tokens;
-        out.completion_tokens += generation.completion_tokens;
-        out.llm_ms += generation.prompt_ms + generation.generation_ms + generation.tokenize_ms;
-        out.profile.tokenize_ms += generation.tokenize_ms;
-        out.profile.prefill_ms += generation.prompt_ms;
-        out.profile.decode_ms += generation.generation_ms;
-        out.profile.new_prompt_tokens += generation.prompt_tokens - generation.cached_tokens;
-        out.profile.generated_tokens += generation.completion_tokens;
+        out.profile.parse_ms += reply.parse_ms;
+        {
+            let generation = &reply.generation;
+            out.prompt_tokens += generation.prompt_tokens;
+            out.cached_tokens += generation.cached_tokens;
+            out.completion_tokens += generation.completion_tokens;
+            out.llm_ms += generation.prompt_ms + generation.generation_ms + generation.tokenize_ms;
+            out.profile.tokenize_ms += generation.tokenize_ms;
+            out.profile.prefill_ms += generation.prompt_ms;
+            out.profile.decode_ms += generation.generation_ms;
+            out.profile.new_prompt_tokens += generation.prompt_tokens - generation.cached_tokens;
+            out.profile.generated_tokens += generation.completion_tokens;
 
-        let raw = format!("{prefill}{}", generation.text);
-        let t_parse = Instant::now();
-        let reply = toolcall::parse_reply(&raw, tools, &mut call_ids);
-        out.profile.parse_ms += ms(t_parse);
-        let t_obs = Instant::now();
-        observer.on_event(&Event::ModelReplied {
-            turn,
-            generation: &generation,
-            content: &reply.content,
-            calls: reply.tool_calls.len(),
-        });
-        out.profile.observer_ms += ms(t_obs);
+            let t_obs = Instant::now();
+            observer.on_event(&Event::ModelReplied {
+                turn,
+                generation,
+                content: &reply.content,
+                calls: reply.tool_calls.len(),
+            });
+            out.profile.observer_ms += ms(t_obs);
+        }
+        // The session owns call ids: they stay unique across turns, and every assistant
+        // call is paired with exactly one tool result. Servers generate their own ids,
+        // which may repeat or be empty.
+        for call in &mut reply.tool_calls {
+            next_call_id += 1;
+            call.id = format!("call_{next_call_id}");
+        }
 
         if reply.tool_calls.is_empty() {
             // A reply with no tool call is malformed under the file/line protocol.
             messages.push(Message::Assistant {
-                content: raw.trim().to_string(),
+                content: reply.assistant_text.clone(),
                 tool_calls: Vec::new(),
             });
             if retries < config.max_retries {
@@ -308,10 +338,12 @@ pub fn run(
                     turn,
                     attempt: retries,
                 });
-                messages.push(Message::User(protocol::retry_feedback(
-                    retries,
-                    config.max_retries,
-                )));
+                let mut feedback = protocol::retry_feedback(retries, config.max_retries);
+                if reply.truncated {
+                    feedback.push('\n');
+                    feedback.push_str(&protocol::truncated_feedback(config.sampling.max_tokens));
+                }
+                messages.push(Message::User(feedback));
                 continue;
             }
             out.end_reason = EndReason::MalformedRetries;
@@ -324,8 +356,29 @@ pub fn run(
         });
         let mut answered: Vec<String> = Vec::new();
         let mut submitted = false;
-        for call in reply.tool_calls.iter().take(config.max_parallel_calls) {
+        for (i, call) in reply
+            .tool_calls
+            .iter()
+            .take(config.max_parallel_calls)
+            .enumerate()
+        {
             answered.push(call.id.clone());
+            let t_obs = Instant::now();
+            observer.on_event(&Event::ToolCalled {
+                turn,
+                tool: &call.name,
+                arguments: &call.arguments,
+            });
+            out.profile.observer_ms += ms(t_obs);
+            // A structured call that failed validation (bad arguments, unknown tool,
+            // missing required argument) is answered but never executed.
+            if let Some(reason) = reply.call_errors.get(i).and_then(Option::as_ref) {
+                messages.push(Message::Tool {
+                    call_id: call.id.clone(),
+                    content: protocol::invalid_call(&call.name, reason),
+                });
+                continue;
+            }
             if call.name == "finish" {
                 let (locations, observation) = parse_finish(call, &sandbox);
                 messages.push(Message::Tool {
@@ -353,13 +406,6 @@ pub fn run(
             let is_search =
                 call.name == "colgrep" || command.split_whitespace().next() == Some("colgrep");
             let tool = if is_search { "colgrep" } else { "terminal" };
-            let t_obs = Instant::now();
-            observer.on_event(&Event::ToolCalled {
-                turn,
-                tool,
-                command: &command,
-            });
-            out.profile.observer_ms += ms(t_obs);
             let started = Instant::now();
             let observation = if is_search {
                 out.n_searches += 1;
@@ -399,6 +445,11 @@ pub fn run(
         // Every sampled call gets a response, including those after finish or past the cap.
         for call in &reply.tool_calls {
             if !answered.contains(&call.id) {
+                observer.on_event(&Event::ToolCalled {
+                    turn,
+                    tool: &call.name,
+                    arguments: &call.arguments,
+                });
                 messages.push(Message::Tool {
                     call_id: call.id.clone(),
                     content: protocol::NOT_EXECUTED.to_string(),
@@ -415,48 +466,6 @@ pub fn run(
 
 fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1000.0
-}
-
-/// Prepare the engine's KV cache for the part of the prompt every session shares
-/// (system prompt and tool definitions). Engines that persist it (built-in
-/// llama.cpp) compute it once and restore it from disk afterwards, so calling this
-/// ahead of time (`colgrep --install-agent`) makes the first question fast too.
-pub fn warm_prefix(
-    template: &ChatTemplate,
-    config: &SessionConfig,
-    llm: &mut dyn Generator,
-) -> Result<(), crate::llm::LlmError> {
-    match static_prefix(template, config) {
-        Some(prefix) => llm.warm_prefix(&prefix),
-        None => Ok(()),
-    }
-}
-
-/// The rendered text every session starts with: what two renders differing only in the
-/// task have in common (system prompt and tool definitions, for chat templates).
-fn static_prefix(template: &ChatTemplate, config: &SessionConfig) -> Option<String> {
-    let render = |task: &str| {
-        template
-            .render(
-                &[
-                    Message::System(config.system_prompt.clone()),
-                    Message::User(task.to_string()),
-                ],
-                &config.tools,
-                config.enable_thinking,
-            )
-            .ok()
-    };
-    let (a, b) = (render("\u{1}")?, render("\u{2}")?);
-    let mut end = a
-        .char_indices()
-        .zip(b.chars())
-        .take_while(|((_, x), y)| x == y)
-        .last()
-        .map(|((i, c), _)| i + c.len_utf8())?;
-    // Stop at a line boundary so the cut never splits a token.
-    end = a[..end].rfind('\n').map(|i| i + 1)?;
-    Some(a[..end].to_string())
 }
 
 /// The command a non-finish call runs, or empty when it is unusable.
@@ -588,10 +597,41 @@ fn parse_finish(call: &ToolCall, sandbox: &Sandbox) -> (Vec<Location>, &'static 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::search::{SearchHit, SearchRequest};
+    use std::sync::{Arc, Mutex};
 
-    struct Scripted(Vec<&'static str>, Vec<String>);
+    use super::*;
+    use crate::llm::prompt::PromptModel;
+    use crate::llm::{Generator, Turn};
+    use crate::search::{SearchHit, SearchRequest};
+    use crate::template::ChatTemplate;
+
+    #[derive(Default)]
+    struct Script {
+        replies: Vec<&'static str>,
+        prompts: Vec<String>,
+    }
+
+    /// A generator whose scripted replies are shared, so a test can inspect the prompts
+    /// after the model has been moved into a `PromptModel`.
+    #[derive(Clone, Default)]
+    struct Scripted(Arc<Mutex<Script>>);
+
+    impl Scripted {
+        fn new(replies: Vec<&'static str>) -> Self {
+            Self(Arc::new(Mutex::new(Script {
+                replies,
+                prompts: Vec::new(),
+            })))
+        }
+
+        fn push(&self, reply: &'static str) {
+            self.0.lock().unwrap().replies.push(reply);
+        }
+
+        fn prompts(&self) -> Vec<String> {
+            self.0.lock().unwrap().prompts.clone()
+        }
+    }
 
     impl Generator for Scripted {
         fn generate_streaming(
@@ -600,11 +640,12 @@ mod tests {
             _: &GenParams,
             _: &mut dyn FnMut(&str),
         ) -> Result<Generation, LlmError> {
-            self.1.push(prompt.to_string());
-            let text = if self.0.is_empty() {
+            let mut script = self.0.lock().unwrap();
+            script.prompts.push(prompt.to_string());
+            let text = if script.replies.is_empty() {
                 ""
             } else {
-                self.0.remove(0)
+                script.replies.remove(0)
             };
             Ok(Generation {
                 text: text.to_string(),
@@ -629,6 +670,13 @@ mod tests {
         }
     }
 
+    struct NeverSearch;
+    impl SearchBackend for NeverSearch {
+        fn search(&mut self, _: &SearchRequest) -> Result<Vec<SearchHit>, String> {
+            panic!("a rejected call must not reach the search backend");
+        }
+    }
+
     fn repo() -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir(d.path().join("src")).unwrap();
@@ -640,27 +688,32 @@ mod tests {
         ChatTemplate::new(protocol::DEFAULT_CHAT_TEMPLATE, "<s>", "</s>").unwrap()
     }
 
+    fn run_prompt(
+        task: &str,
+        repo: &Path,
+        config: &SessionConfig,
+        llm: &Scripted,
+        backend: &mut dyn SearchBackend,
+    ) -> Outcome {
+        let mut model = PromptModel::new(template(), Box::new(llm.clone()));
+        run(task, repo, config, &mut model, backend, &mut ()).unwrap()
+    }
+
     #[test]
     fn search_read_finish() {
         let d = repo();
-        let mut llm = Scripted(
-            vec![
-                "<function name=\"colgrep\"><param name=\"query\">token check</param></function>",
-                "<function name=\"terminal\"><param name=\"command\">cat src/auth.py</param></function>",
-                "<function name=\"finish\"><param name=\"locations\">[\"src/auth.py:1-2\", \"nope.py:1-2\"]</param></function>",
-            ],
-            vec![],
-        );
-        let out = run(
+        let llm = Scripted::new(vec![
+            "<function name=\"colgrep\"><param name=\"query\">token check</param></function>",
+            "<function name=\"terminal\"><param name=\"command\">cat src/auth.py</param></function>",
+            "<function name=\"finish\"><param name=\"locations\">[\"src/auth.py:1-2\", \"nope.py:1-2\"]</param></function>",
+        ]);
+        let out = run_prompt(
             "fix check",
             d.path(),
             &SessionConfig::default(),
-            &template(),
-            &mut llm,
+            &llm,
             &mut OneHit,
-            &mut (),
-        )
-        .unwrap();
+        );
         assert_eq!(out.end_reason, EndReason::Answered);
         assert_eq!(
             out.locations
@@ -670,59 +723,42 @@ mod tests {
             vec!["src/auth.py:1-2"]
         );
         assert_eq!((out.n_searches, out.n_reads, out.turns), (1, 1, 3));
-        let second_prompt = &llm.1[1];
+        let prompts = llm.prompts();
+        let second_prompt = &prompts[1];
         assert!(second_prompt.contains(
             "<tool_response>\n$ colgrep 'token check'\n[1] src/auth.py:1-2  (function check)\n      def check():\n          pass\n\n[This is the output of turn 1 (10 turn limit).]\n</tool_response>"
         ));
-        assert!(llm.1[0].contains("Problem statement:\nfix check\n\nYou are at the repository root. Top-level contents:\nsrc/\n\n"));
+        assert!(prompts[0].contains("Problem statement:\nfix check\n\nYou are at the repository root. Top-level contents:\nsrc/\n\n"));
     }
 
     #[test]
     fn last_turn_serves_only_finish() {
         let d = repo();
         let read = "<function name=\"terminal\"><param name=\"command\">ls</param></function>";
-        let mut llm = Scripted(vec![read; 9], vec![]);
-        llm.0
-            .push("<param name=\"locations\">[\"src/auth.py:1-2\"]</param></function>");
-        let out = run(
-            "t",
-            d.path(),
-            &SessionConfig::default(),
-            &template(),
-            &mut llm,
-            &mut OneHit,
-            &mut (),
-        )
-        .unwrap();
+        let llm = Scripted::new(vec![read; 9]);
+        llm.push("<param name=\"locations\">[\"src/auth.py:1-2\"]</param></function>");
+        let out = run_prompt("t", d.path(), &SessionConfig::default(), &llm, &mut OneHit);
         assert_eq!(out.turns, 10);
         assert_eq!(out.end_reason, EndReason::Answered);
-        let last = llm.1.last().unwrap();
+        let prompts = llm.prompts();
+        let last = prompts.last().unwrap();
         assert!(last.ends_with(&format!(
             "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<function name=\"finish\">",
             protocol::FINAL_TURN_REMINDER
         )));
         // Only the finish tool is listed in the final system turn.
         assert!(!last.contains("\"name\": \"colgrep\""));
-        assert!(llm.1[0].contains("\"name\": \"colgrep\""));
+        assert!(prompts[0].contains("\"name\": \"colgrep\""));
     }
 
     #[test]
     fn text_replies_are_retried_then_give_up() {
         let d = repo();
-        let mut llm = Scripted(vec!["src/auth.py:1-2"; 4], vec![]);
-        let out = run(
-            "t",
-            d.path(),
-            &SessionConfig::default(),
-            &template(),
-            &mut llm,
-            &mut OneHit,
-            &mut (),
-        )
-        .unwrap();
+        let llm = Scripted::new(vec!["src/auth.py:1-2"; 4]);
+        let out = run_prompt("t", d.path(), &SessionConfig::default(), &llm, &mut OneHit);
         assert_eq!(out.end_reason, EndReason::MalformedRetries);
         assert!(out.locations.is_empty());
-        assert!(llm.1[1].contains("That was not a valid action. Either call a tool with a command, or submit via finish / <answer>.\n(Attempt 1/3)"));
+        assert!(llm.prompts()[1].contains("That was not a valid action. Either call a tool with a command, or submit via finish / <answer>.\n(Attempt 1/3)"));
     }
 
     #[test]
@@ -731,22 +767,13 @@ mod tests {
         let call = "<function name=\"terminal\"><param name=\"command\">pwd</param></function>";
         let six = [call; 6].join("\n");
         let six: &'static str = Box::leak(six.into_boxed_str());
-        let mut llm = Scripted(vec![six], vec![]);
+        let llm = Scripted::new(vec![six]);
         let cfg = SessionConfig {
             max_turns: 2,
             force_finish_last_turn: false,
             ..Default::default()
         };
-        let out = run(
-            "t",
-            d.path(),
-            &cfg,
-            &template(),
-            &mut llm,
-            &mut OneHit,
-            &mut (),
-        )
-        .unwrap();
+        let out = run_prompt("t", d.path(), &cfg, &llm, &mut OneHit);
         let tool_msgs: Vec<&Message> = out
             .messages
             .iter()
@@ -756,5 +783,277 @@ mod tests {
         assert!(
             matches!(tool_msgs[5], Message::Tool { content, .. } if content == protocol::NOT_EXECUTED)
         );
+    }
+
+    // ------------------------------------------------- structured (chat) turns
+
+    fn call(name: &str, args: &str) -> ToolCall {
+        ToolCall {
+            id: String::new(),
+            name: name.into(),
+            arguments: serde_json::from_str(args).unwrap(),
+        }
+    }
+
+    fn turn(calls: Vec<ToolCall>, errors: Vec<Option<String>>) -> Turn {
+        Turn {
+            tool_calls: calls,
+            call_errors: errors,
+            ..Default::default()
+        }
+    }
+
+    /// A model that returns scripted turns and records what the session sent it.
+    #[derive(Default)]
+    struct TurnScript {
+        turns: Vec<Turn>,
+        seen: Vec<(Vec<Message>, Vec<String>, bool)>,
+    }
+
+    impl TurnModel for TurnScript {
+        fn next_turn(
+            &mut self,
+            messages: &[Message],
+            tools: &[Value],
+            options: &TurnOptions,
+            _: &mut dyn FnMut(&str),
+        ) -> Result<Turn, LlmError> {
+            self.seen.push((
+                messages.to_vec(),
+                tools
+                    .iter()
+                    .filter_map(|t| {
+                        t.pointer("/function/name")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .collect(),
+                options.final_turn,
+            ));
+            Ok(self.turns.remove(0))
+        }
+    }
+
+    fn tool_results(messages: &[Message]) -> Vec<(String, String)> {
+        messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::Tool { call_id, content } => Some((call_id.clone(), content.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn chat_turns_pair_calls_with_results_and_keep_history() {
+        let d = repo();
+        let mut script = TurnScript {
+            turns: vec![
+                turn(
+                    vec![
+                        call("colgrep", r#"{"query":"check"}"#),
+                        call("terminal", r#"{"command":"cat src/auth.py"}"#),
+                    ],
+                    vec![None, None],
+                ),
+                turn(
+                    vec![call("finish", r#"{"locations":["src/auth.py:1-2"]}"#)],
+                    vec![None],
+                ),
+            ],
+            seen: Vec::new(),
+        };
+        let out = run(
+            "t",
+            d.path(),
+            &SessionConfig::default(),
+            &mut script,
+            &mut OneHit,
+            &mut (),
+        )
+        .unwrap();
+        assert_eq!(out.end_reason, EndReason::Answered);
+        assert_eq!(out.locations[0].to_string(), "src/auth.py:1-2");
+        assert_eq!((out.n_searches, out.n_reads, out.turns), (1, 1, 2));
+
+        // The second request carries the assistant's two calls and one result for each,
+        // with matching ids (the server did not supply any).
+        let second = &script.seen[1].0;
+        let ids = match second.get(2) {
+            Some(Message::Assistant { tool_calls, .. }) => {
+                tool_calls.iter().map(|c| c.id.clone()).collect::<Vec<_>>()
+            }
+            other => panic!("expected the assistant turn, got {other:?}"),
+        };
+        assert_eq!(ids, vec!["call_1", "call_2"]);
+        let results = tool_results(second);
+        assert_eq!(
+            results
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["call_1", "call_2"]
+        );
+        assert!(results[0].1.contains("$ colgrep check"));
+        assert!(results[1].1.contains("def check():"));
+    }
+
+    #[test]
+    fn chat_rejects_invalid_calls_without_executing_them() {
+        let d = repo();
+        let mut script = TurnScript {
+            turns: vec![
+                turn(
+                    vec![
+                        call("colgrep", r#"{"query":"x"}"#),
+                        call("terminal", r#"{"command":"pwd"}"#),
+                    ],
+                    vec![Some("arguments are not valid JSON: boom".into()), None],
+                ),
+                turn(vec![call("finish", r#"{"locations":[]}"#)], vec![None]),
+            ],
+            seen: Vec::new(),
+        };
+        let out = run(
+            "t",
+            d.path(),
+            &SessionConfig::default(),
+            &mut script,
+            &mut NeverSearch,
+            &mut (),
+        )
+        .unwrap();
+        assert_eq!(out.end_reason, EndReason::AnsweredEmpty);
+        let results = tool_results(&script.seen[1].0);
+        assert!(results[0].1.contains("arguments are not valid JSON: boom"));
+        assert!(results[0].1.contains("the 'colgrep' call was not executed"));
+        // The valid call in the same turn still executes.
+        assert!(results[1].1.contains("$ pwd"));
+    }
+
+    #[test]
+    fn chat_calls_after_finish_are_answered_not_executed() {
+        let d = repo();
+        let mut script = TurnScript {
+            turns: vec![turn(
+                vec![
+                    call("finish", r#"{"locations":["src/auth.py:1-2"]}"#),
+                    call("terminal", r#"{"command":"pwd"}"#),
+                ],
+                vec![None, None],
+            )],
+            seen: Vec::new(),
+        };
+        let out = run(
+            "t",
+            d.path(),
+            &SessionConfig::default(),
+            &mut script,
+            &mut NeverSearch,
+            &mut (),
+        )
+        .unwrap();
+        assert_eq!(out.end_reason, EndReason::Answered);
+        assert_eq!(out.locations[0].to_string(), "src/auth.py:1-2");
+        // The call after finish is paired with a result but never run.
+        let results = tool_results(&out.messages);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[1].1, protocol::NOT_EXECUTED);
+        assert!(out.profile.terminal_ms.is_empty());
+    }
+
+    #[test]
+    fn chat_rejected_finish_is_answered_but_not_submitted() {
+        let d = repo();
+        let mut script = TurnScript {
+            turns: vec![turn(
+                vec![call("finish", r#"{"locations":["src/auth.py:1-2"]}"#)],
+                vec![Some("arguments are not valid JSON: boom".into())],
+            )],
+            seen: Vec::new(),
+        };
+        let cfg = SessionConfig {
+            max_turns: 1,
+            ..Default::default()
+        };
+        let out = run("t", d.path(), &cfg, &mut script, &mut NeverSearch, &mut ()).unwrap();
+        assert_eq!(out.end_reason, EndReason::MaxTurns);
+        assert!(out.locations.is_empty());
+        let results = tool_results(&out.messages);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("the 'finish' call was not executed"));
+    }
+
+    #[test]
+    fn chat_truncated_reply_asks_for_a_call() {
+        let d = repo();
+        let mut script = TurnScript {
+            turns: vec![
+                Turn {
+                    assistant_text: "I was writing a long explanation".into(),
+                    truncated: true,
+                    ..Default::default()
+                },
+                turn(
+                    vec![call("finish", r#"{"locations":["src/auth.py:1-2"]}"#)],
+                    vec![None],
+                ),
+            ],
+            seen: Vec::new(),
+        };
+        let out = run(
+            "t",
+            d.path(),
+            &SessionConfig::default(),
+            &mut script,
+            &mut OneHit,
+            &mut (),
+        )
+        .unwrap();
+        assert_eq!(out.end_reason, EndReason::Answered);
+        let second = &script.seen[1].0;
+        assert!(matches!(
+            second.last(),
+            Some(Message::User(text)) if text.contains("cut off at the 2048-token limit")
+        ));
+        assert!(matches!(
+            second.get(2),
+            Some(Message::Assistant { content, .. }) if content == "I was writing a long explanation"
+        ));
+    }
+
+    #[test]
+    fn chat_final_turn_serves_only_finish() {
+        let d = repo();
+        let mut script = TurnScript {
+            turns: vec![
+                turn(vec![call("colgrep", r#"{"query":"check"}"#)], vec![None]),
+                turn(vec![call("colgrep", r#"{"query":"check"}"#)], vec![None]),
+                turn(
+                    vec![call("finish", r#"{"locations":["src/auth.py:1-2"]}"#)],
+                    vec![None],
+                ),
+            ],
+            seen: Vec::new(),
+        };
+        let cfg = SessionConfig {
+            max_turns: 3,
+            ..Default::default()
+        };
+        let out = run("t", d.path(), &cfg, &mut script, &mut OneHit, &mut ()).unwrap();
+        assert_eq!(out.end_reason, EndReason::Answered);
+        assert!(!script.seen[0].2);
+        assert!(script.seen[2].2);
+        assert_eq!(script.seen[2].1, vec!["finish"]);
+        // The recorded requests make the final-turn narrowing auditable.
+        assert_eq!(out.requests.len(), 3);
+        assert_eq!(out.requests[0].tools.len(), 3);
+        assert!(!out.requests[0].final_turn);
+        assert_eq!(out.requests[2].tools, vec!["finish"]);
+        assert!(out.requests[2].final_turn);
+        assert!(matches!(
+            script.seen[2].0.last(),
+            Some(Message::User(text)) if text == protocol::FINAL_TURN_REMINDER
+        ));
     }
 }

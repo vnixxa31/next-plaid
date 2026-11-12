@@ -20,6 +20,9 @@ use super::{GenParams, Generation, Generator, LlmError};
 /// How long model loading may take before giving up.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Per-request timeout for the private server (one turn's prefill + generation).
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(600);
+
 #[derive(Debug, Clone)]
 pub struct ServerOptions {
     pub context_size: usize,
@@ -128,7 +131,13 @@ impl LlamaServer {
         let base = format!("http://127.0.0.1:{port}");
         let mut this = Self {
             child,
-            client: OpenAiCompletions::new(&format!("{base}/v1"), "local", "", Some(key.clone())),
+            client: OpenAiCompletions::new(
+                &format!("{base}/v1"),
+                "local",
+                "",
+                Some(key.clone()),
+                CLIENT_TIMEOUT,
+            ),
             log,
             device: String::new(),
             props: ServerProps::default(),
@@ -142,6 +151,7 @@ impl LlamaServer {
             "local",
             &this.props.bos_token,
             Some(key),
+            CLIENT_TIMEOUT,
         );
         this.device = match gpu {
             Some(gpu) => format!("GPU: {}", gpu.name),
