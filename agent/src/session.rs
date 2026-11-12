@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::llm::{GenParams, Generation, LlmError, TurnModel, TurnOptions};
 use crate::protocol::{self, Message, ToolCall};
@@ -101,10 +101,16 @@ pub enum Event<'a> {
         content: &'a str,
         calls: usize,
     },
+    /// A call the model produced, before it runs.
+    ///
+    /// A backend that streams markup renders the call while the model writes it; a
+    /// structured backend has no markup to stream, so this is where its calls become
+    /// visible. Each call is announced exactly once, whether or not it is executed.
     ToolCalled {
         turn: usize,
+        /// The tool name as the model wrote it (`colgrep`, `terminal`, `finish`).
         tool: &'a str,
-        command: &'a str,
+        arguments: &'a Map<String, Value>,
     },
     ToolReturned {
         turn: usize,
@@ -357,6 +363,13 @@ pub fn run(
             .enumerate()
         {
             answered.push(call.id.clone());
+            let t_obs = Instant::now();
+            observer.on_event(&Event::ToolCalled {
+                turn,
+                tool: &call.name,
+                arguments: &call.arguments,
+            });
+            out.profile.observer_ms += ms(t_obs);
             // A structured call that failed validation (bad arguments, unknown tool,
             // missing required argument) is answered but never executed.
             if let Some(reason) = reply.call_errors.get(i).and_then(Option::as_ref) {
@@ -393,13 +406,6 @@ pub fn run(
             let is_search =
                 call.name == "colgrep" || command.split_whitespace().next() == Some("colgrep");
             let tool = if is_search { "colgrep" } else { "terminal" };
-            let t_obs = Instant::now();
-            observer.on_event(&Event::ToolCalled {
-                turn,
-                tool,
-                command: &command,
-            });
-            out.profile.observer_ms += ms(t_obs);
             let started = Instant::now();
             let observation = if is_search {
                 out.n_searches += 1;
@@ -439,6 +445,11 @@ pub fn run(
         // Every sampled call gets a response, including those after finish or past the cap.
         for call in &reply.tool_calls {
             if !answered.contains(&call.id) {
+                observer.on_event(&Event::ToolCalled {
+                    turn,
+                    tool: &call.name,
+                    arguments: &call.arguments,
+                });
                 messages.push(Message::Tool {
                     call_id: call.id.clone(),
                     content: protocol::NOT_EXECUTED.to_string(),

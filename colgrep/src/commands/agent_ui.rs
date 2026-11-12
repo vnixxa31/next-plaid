@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
+use serde_json::{Map, Value};
 
 use colgrep_agent::session::{Event, Observer};
 use colgrep_agent::toolcall::{CDATA_OPEN, FUNCTION_CLOSE, FUNCTION_OPEN, PARAM_CLOSE, PARAM_OPEN};
@@ -33,6 +34,8 @@ enum State {
 
 /// Renders one session to stderr.
 pub struct AgentView {
+    /// Where the view writes: stderr, or a buffer in tests.
+    out: Box<dyn Write>,
     spinner: Option<ProgressBar>,
     /// Raw text of the current turn, and how much of it has been rendered.
     buf: String,
@@ -44,11 +47,22 @@ pub struct AgentView {
     in_text: bool,
     /// Whitespace of the free text, printed only once more text follows it.
     pending_ws: String,
+    /// Calls of this turn rendered from streamed markup, and announced by the session.
+    /// A backend that streams markup (the completion backend) announces each call it
+    /// already showed; a structured backend (chat completions) has no markup, so the
+    /// view draws the call when it is announced.
+    rendered_calls: usize,
+    announced_calls: usize,
 }
 
 impl AgentView {
     pub fn new() -> Self {
+        Self::with_writer(Box::new(std::io::stderr()))
+    }
+
+    fn with_writer(out: Box<dyn Write>) -> Self {
         Self {
+            out,
             spinner: None,
             buf: String::new(),
             pos: 0,
@@ -56,6 +70,8 @@ impl AgentView {
             line_start: true,
             in_text: false,
             pending_ws: String::new(),
+            rendered_calls: 0,
+            announced_calls: 0,
         }
     }
 
@@ -129,9 +145,8 @@ impl AgentView {
         if s.is_empty() {
             return;
         }
-        let mut err = std::io::stderr().lock();
-        let _ = write!(err, "{s}");
-        let _ = err.flush();
+        let _ = write!(self.out, "{s}");
+        let _ = self.out.flush();
         self.line_start = s.ends_with('\n');
     }
 
@@ -301,6 +316,7 @@ impl AgentView {
         self.stop_spinner();
         self.pending_ws.clear();
         self.newline();
+        self.rendered_calls += 1;
         let name = match tool {
             "colgrep" => tool.magenta().bold(),
             "terminal" => tool.blue().bold(),
@@ -313,11 +329,7 @@ impl AgentView {
 
     fn open_param(&mut self, tool: &str, name: &str, index: usize) {
         // The main argument of each tool is shown bare; the others as `name=`.
-        let main = matches!(
-            (tool, name),
-            ("colgrep", "query") | ("terminal", "command") | ("finish", "locations")
-        );
-        if !main || index > 0 {
+        if !main_argument(tool, name) || index > 0 {
             self.print(&format!(" {}", format!("{name}=").dimmed()));
         } else {
             self.print(" ");
@@ -340,6 +352,29 @@ impl AgentView {
             _ => value.to_string(),
         };
         self.print(&shown);
+    }
+
+    /// Draw a call the model did not stream as markup: a structured backend hands the
+    /// session whole calls, so the view formats the arguments the same way the markup
+    /// parser does (`● tool  main` then `name=value` for the rest).
+    fn render_call(&mut self, tool: &str, arguments: &Map<String, Value>) {
+        self.open_call(tool);
+        // The argument that says what the call does leads, then the rest in the
+        // model's own order.
+        let ordered: Vec<(&String, &Value)> = arguments
+            .iter()
+            .filter(|(name, _)| main_argument(tool, name))
+            .chain(
+                arguments
+                    .iter()
+                    .filter(|(name, _)| !main_argument(tool, name)),
+            )
+            .collect();
+        for (index, (name, value)) in ordered.into_iter().enumerate() {
+            self.open_param(tool, name, index);
+            self.value(tool, &arg_text(value));
+        }
+        self.newline();
     }
 
     fn tool_result(&mut self, tool: &str, observation: &str, elapsed_ms: f64) {
@@ -375,6 +410,8 @@ impl Observer for AgentView {
                 self.state = State::Outside;
                 self.in_text = false;
                 self.pending_ws.clear();
+                self.rendered_calls = 0;
+                self.announced_calls = 0;
                 self.newline();
                 self.spin(if *final_turn {
                     "wrapping up"
@@ -397,7 +434,15 @@ impl Observer for AgentView {
                 }
                 self.newline();
             }
-            Event::ToolCalled { .. } => {}
+            Event::ToolCalled {
+                tool, arguments, ..
+            } => {
+                self.announced_calls += 1;
+                // A streamed call was already drawn; a structured one was not.
+                if self.rendered_calls < self.announced_calls {
+                    self.render_call(tool, arguments);
+                }
+            }
             Event::ToolReturned {
                 tool,
                 observation,
@@ -428,6 +473,29 @@ fn attr(tag: &str, name: &str) -> Option<String> {
     let start = tag.find(&key)? + key.len();
     let end = tag[start..].find('"')?;
     Some(tag[start..start + end].to_string())
+}
+
+/// The argument that says what a call does, shown without its name.
+fn main_argument(tool: &str, name: &str) -> bool {
+    matches!(
+        (tool, name),
+        ("colgrep", "query") | ("terminal", "command") | ("finish", "locations")
+    )
+}
+
+/// An argument as the model would have written it in markup. A list stays a list with
+/// `", "` separators, the shape [`AgentView::value`] strips for `finish` locations.
+fn arg_text(value: &Value) -> String {
+    if let Value::Array(items) = value {
+        let strings: Option<Vec<&str>> = items.iter().map(Value::as_str).collect();
+        if let Some(strings) = strings {
+            return format!("{strings:?}");
+        }
+    }
+    match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// One line describing what a tool returned.
@@ -495,6 +563,123 @@ fn summarize(tool: &str, observation: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sink that keeps what the view printed.
+    #[derive(Clone, Default)]
+    struct Capture(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Capture {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.borrow().clone()).unwrap()
+        }
+    }
+
+    fn view() -> (Capture, AgentView) {
+        colored::control::set_override(false);
+        let out = Capture::default();
+        let view = AgentView::with_writer(Box::new(out.clone()));
+        (out, view)
+    }
+
+    fn args(json: &str) -> Map<String, Value> {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn structured_calls_are_drawn_from_events() {
+        let (out, mut view) = view();
+        let call = args(r#"{"query": "token expiry"}"#);
+        view.on_event(&Event::TurnStarted {
+            turn: 1,
+            max_turns: 10,
+            final_turn: false,
+        });
+        view.on_event(&Event::ToolCalled {
+            turn: 1,
+            tool: "colgrep",
+            arguments: &call,
+        });
+        assert_eq!(out.text(), "  ● colgrep  token expiry\n");
+        // The result line starts on a line of its own.
+        view.on_event(&Event::ToolReturned {
+            turn: 1,
+            tool: "colgrep",
+            observation: "[1] a.py:1-2  (function f)",
+            elapsed_ms: 120.0,
+        });
+        assert_eq!(
+            out.text(),
+            "  ● colgrep  token expiry\n    ⎿  1 hit · a.py · 120 ms\n"
+        );
+    }
+
+    #[test]
+    fn structured_calls_show_their_other_arguments() {
+        let (out, mut view) = view();
+        // The model's own order puts `k` first; the call's main argument leads anyway.
+        let call = args(r#"{"k": 5, "query": "harbor lights"}"#);
+        view.on_event(&Event::TurnStarted {
+            turn: 1,
+            max_turns: 10,
+            final_turn: false,
+        });
+        view.on_event(&Event::ToolCalled {
+            turn: 1,
+            tool: "colgrep",
+            arguments: &call,
+        });
+        assert_eq!(out.text(), "  ● colgrep  harbor lights k=5\n");
+    }
+
+    #[test]
+    fn structured_finish_locations_are_laid_out() {
+        let (out, mut view) = view();
+        let call = args(r#"{"locations": ["a.py:1-2", "b.py:3-4"]}"#);
+        view.on_event(&Event::TurnStarted {
+            turn: 1,
+            max_turns: 1,
+            final_turn: true,
+        });
+        view.on_event(&Event::ToolCalled {
+            turn: 1,
+            tool: "finish",
+            arguments: &call,
+        });
+        assert_eq!(out.text(), "  ● finish  a.py:1-2  b.py:3-4\n");
+    }
+
+    #[test]
+    fn streamed_calls_are_not_drawn_twice() {
+        let (out, mut view) = view();
+        let call = args(r#"{"query": "token expiry"}"#);
+        view.on_event(&Event::TurnStarted {
+            turn: 1,
+            max_turns: 10,
+            final_turn: false,
+        });
+        view.on_event(&Event::Token {
+            turn: 1,
+            text:
+                "<function name=\"colgrep\"><param name=\"query\">token expiry</param></function>",
+        });
+        view.on_event(&Event::ToolCalled {
+            turn: 1,
+            tool: "colgrep",
+            arguments: &call,
+        });
+        assert_eq!(out.text().matches('●').count(), 1, "{}", out.text());
+    }
 
     #[test]
     fn markup_split_across_tokens_is_consumed_whole() {
