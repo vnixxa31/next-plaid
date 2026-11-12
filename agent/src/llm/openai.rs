@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::{GenParams, Generation, Generator, LlmError};
+use super::{token_counts, GenParams, Generation, Generator, LlmError};
 
 pub struct OpenAiCompletions {
     base_url: String,
@@ -22,15 +22,19 @@ pub struct OpenAiCompletions {
 }
 
 impl OpenAiCompletions {
-    pub fn new(base_url: &str, model: &str, bos_text: &str, api_key: Option<String>) -> Self {
+    pub fn new(
+        base_url: &str,
+        model: &str,
+        bos_text: &str,
+        api_key: Option<String>,
+        timeout: Duration,
+    ) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             model: model.to_string(),
             api_key,
             bos_text: bos_text.to_string(),
-            agent: ureq::AgentBuilder::new()
-                .timeout(Duration::from_secs(600))
-                .build(),
+            agent: ureq::AgentBuilder::new().timeout(timeout).build(),
         }
     }
 }
@@ -150,14 +154,14 @@ impl Generator for OpenAiCompletions {
                  skip_special_tokens=false)"
             )));
         }
-        let count = |p: &str| usage.pointer(p).and_then(Value::as_u64).unwrap_or(0) as usize;
+        let (prompt_tokens, cached_tokens, completion_tokens) = token_counts(&usage);
         let ms = |k: &str| timings.get(k).and_then(Value::as_f64).unwrap_or(0.0);
         let first = first_token_ms.unwrap_or(elapsed);
         Ok(Generation {
             text,
-            prompt_tokens: count("/prompt_tokens"),
-            cached_tokens: count("/prompt_tokens_details/cached_tokens"),
-            completion_tokens: count("/completion_tokens"),
+            prompt_tokens,
+            cached_tokens,
+            completion_tokens,
             prompt_ms: if ms("prompt_ms") > 0.0 {
                 ms("prompt_ms")
             } else {
@@ -179,7 +183,7 @@ impl Generator for OpenAiCompletions {
 /// (`exceed_context_size_error`); vLLM / OpenAI: `maximum context length is M tokens.
 /// However, you requested N tokens` or, in current vLLM, `... for a total of N tokens`
 /// (prompt plus the room asked for the answer).
-fn context_overflow(body: &str) -> Option<LlmError> {
+pub(super) fn context_overflow(body: &str) -> Option<LlmError> {
     // The integers directly followed by " tokens", in order.
     let counts: Vec<usize> = body
         .match_indices(" tokens")

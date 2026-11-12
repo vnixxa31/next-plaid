@@ -1,50 +1,104 @@
-//! Build the generator a session runs on, from the user's settings.
+//! Build the model a session runs on, from the user's settings.
 
-use crate::config::AgentSettings;
+use std::time::Duration;
+
+use crate::config::{AgentSettings, EndpointApi};
+use crate::llm::chat::OpenAiChat;
 use crate::llm::openai::OpenAiCompletions;
-use crate::llm::Generator;
+use crate::llm::prompt::PromptModel;
+use crate::llm::TurnModel;
 use crate::protocol;
 use crate::template::ChatTemplate;
 
-/// A ready-to-use model: generator, the chat template to render prompts with, and a
-/// one-line description for display.
+/// Which inference path a session uses (for diagnostics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// llama.cpp compiled into colgrep (Apple Silicon).
+    Builtin,
+    /// The managed `llama-server` subprocess.
+    Server,
+    /// A user-configured endpoint's raw `/completions` API.
+    Completions,
+    /// A user-configured endpoint's `/chat/completions` API.
+    Chat,
+}
+
+impl Backend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Server => "llama-server",
+            Self::Completions => "completions",
+            Self::Chat => "chat-completions",
+        }
+    }
+}
+
+/// A ready-to-use model and a one-line description for display.
 pub struct Engine {
-    pub generator: Box<dyn Generator>,
-    pub template: ChatTemplate,
+    pub model: Box<dyn TurnModel>,
+    pub backend: Backend,
     pub description: String,
 }
 
-/// Load the engine the settings describe: an OpenAI-compatible endpoint when one is
+/// Load the model the settings describe: an OpenAI-compatible endpoint when one is
 /// configured, local inference otherwise.
 ///
-/// The chat template is, in order: the configured template file, the template embedded
-/// in the model file, then the bundled template of the default model.
+/// For the prompt backends the chat template is, in order: the configured template file,
+/// the template embedded in the model file, then the bundled template of the default
+/// model. The chat backend has no client-side template: the server applies the model's.
 pub fn load_engine(
     settings: &AgentSettings,
     force_cpu: bool,
     progress: bool,
 ) -> Result<Engine, String> {
-    let template_override = settings.chat_template_override()?;
     if let Some(endpoint) = &settings.endpoint {
-        let source =
-            template_override.unwrap_or_else(|| protocol::DEFAULT_CHAT_TEMPLATE.to_string());
-        let template =
-            ChatTemplate::new(&source, "<s>", "</s>").map_err(|e| format!("chat template: {e}"))?;
-        let model = settings
+        let model_id = settings
             .endpoint_model
             .clone()
             .unwrap_or_else(|| settings.model().to_string());
-        return Ok(Engine {
-            generator: Box::new(OpenAiCompletions::new(
-                endpoint,
-                &model,
-                "<s>",
-                crate::llm::openai::api_key_from_env(),
-            )),
-            template,
-            description: format!("{model} @ {endpoint}"),
-        });
+        let key = crate::llm::openai::api_key_from_env();
+        let timeout = Duration::from_secs(settings.endpoint_timeout_secs());
+        match settings.endpoint_api() {
+            EndpointApi::Chat => {
+                if settings.chat_template_file.is_some() {
+                    eprintln!(
+                        "warning: --agent-chat-template is ignored by the chat backend: the \
+                         server applies the model's own template (clear it with \
+                         `colgrep settings --agent-chat-template default`)"
+                    );
+                }
+                return Ok(Engine {
+                    model: Box::new(OpenAiChat::new(endpoint, &model_id, key, timeout)),
+                    backend: Backend::Chat,
+                    description: format!("{model_id} @ {endpoint} (chat)"),
+                });
+            }
+            EndpointApi::Completions => {
+                let source = settings
+                    .chat_template_override()?
+                    .unwrap_or_else(|| protocol::DEFAULT_CHAT_TEMPLATE.to_string());
+                let template = ChatTemplate::new(&source, "<s>", "</s>")
+                    .map_err(|e| format!("chat template: {e}"))?;
+                return Ok(Engine {
+                    model: Box::new(PromptModel::new(
+                        template,
+                        Box::new(OpenAiCompletions::new(
+                            endpoint, &model_id, "<s>", key, timeout,
+                        )),
+                    )),
+                    backend: Backend::Completions,
+                    description: format!("{model_id} @ {endpoint} (completions)"),
+                });
+            }
+        }
     }
+    if settings.endpoint_api == Some(EndpointApi::Chat) {
+        return Err("the chat backend needs an endpoint: set one with \
+             `colgrep settings --agent-endpoint http://host:port/v1`"
+            .into());
+    }
+    let template_override = settings.chat_template_override()?;
     load_local(settings, template_override, force_cpu, progress)
 }
 
@@ -216,8 +270,8 @@ fn load_server(
         server.device
     );
     Ok(Engine {
-        generator: Box::new(server),
-        template,
+        model: Box::new(PromptModel::new(template, Box::new(server))),
+        backend: Backend::Server,
         description,
     })
 }
@@ -270,8 +324,8 @@ fn load_builtin(
         format!("CPU, {threads} threads")
     };
     Ok(Engine {
-        generator: Box::new(engine),
-        template,
+        model: Box::new(PromptModel::new(template, Box::new(engine))),
+        backend: Backend::Builtin,
         description: format!("{} ({device})", file_name(path)),
     })
 }
@@ -321,4 +375,59 @@ fn load_local(
          `colgrep settings --agent-endpoint http://host:port/v1`"
             .into(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AgentSettings, EndpointApi};
+
+    #[test]
+    fn a_chat_endpoint_selects_the_chat_backend() {
+        let s = AgentSettings {
+            endpoint: Some("http://127.0.0.1:9/v1".into()),
+            endpoint_api: Some(EndpointApi::Chat),
+            ..Default::default()
+        };
+        let engine = load_engine(&s, false, false).unwrap();
+        assert_eq!(engine.backend, Backend::Chat);
+        assert!(engine.description.ends_with("(chat)"));
+    }
+
+    #[test]
+    fn an_endpoint_without_an_api_keeps_the_completions_backend() {
+        let s = AgentSettings {
+            endpoint: Some("http://127.0.0.1:9/v1".into()),
+            ..Default::default()
+        };
+        let engine = load_engine(&s, false, false).unwrap();
+        assert_eq!(engine.backend, Backend::Completions);
+        assert!(engine.description.ends_with("(completions)"));
+    }
+
+    #[test]
+    fn the_chat_backend_does_not_read_the_ignored_template() {
+        let s = AgentSettings {
+            endpoint: Some("http://127.0.0.1:9/v1".into()),
+            endpoint_api: Some(EndpointApi::Chat),
+            chat_template_file: Some("/definitely/missing.jinja".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            load_engine(&s, false, false).unwrap().backend,
+            Backend::Chat
+        );
+    }
+
+    #[test]
+    fn the_chat_backend_requires_an_endpoint() {
+        let s = AgentSettings {
+            endpoint_api: Some(EndpointApi::Chat),
+            ..Default::default()
+        };
+        match load_engine(&s, false, false) {
+            Err(err) => assert!(err.contains("needs an endpoint"), "{err}"),
+            Ok(_) => panic!("the chat backend must not load without an endpoint"),
+        }
+    }
 }

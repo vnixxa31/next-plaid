@@ -43,6 +43,20 @@ pub fn retry_feedback(attempt: usize, max_retries: usize) -> String {
     )
 }
 
+/// Appended to [`retry_feedback`] when the reply stopped at the generation limit.
+pub fn truncated_feedback(max_tokens: usize) -> String {
+    format!(
+        "Your previous reply was cut off at the {max_tokens}-token limit before any tool \
+         call. Reply with one tool call."
+    )
+}
+
+/// The tool reply for a structured call rejected before execution (bad arguments,
+/// unknown tool name, missing required argument).
+pub fn invalid_call(name: &str, reason: &str) -> String {
+    format!("ERROR: {reason}; the '{name}' call was not executed.")
+}
+
 /// The first user turn: the task plus the repository's root listing.
 pub fn task_prompt(task: &str, root_listing: &str) -> String {
     format!(
